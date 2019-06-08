@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+
+    <title>From C to PEP-249</title>
+    <link rel="stylesheet" href="./css/reveal.css" />
+    <link rel="stylesheet" href="./css/theme/serif.css" id="theme" />
+    <link rel="stylesheet" href="./css/highlight/github-gist.css" />
+    <link rel="stylesheet" href="./css/print/paper.css" type="text/css" media="print" />
+
+  </head>
+  <body>
+    <div class="reveal">
+      <div class="slides"><section  data-markdown><script type="text/template">## From C to PEP-249
+### A Database API Odyssey
+Matt Wozniski (Bloomberg)
+
+<aside class="notes"><p>Hi - I&#39;m Matt Wozniski.  I work for Bloomberg, and I&#39;m going to talk to you
+about my experiences adapting Comdb2, an open source distributed relational
+database system that we created, to the Python DB API.  I realize that most
+developers will never need to implement a new database interface, and that this
+topic is therefore a bit in the weeds, but most developers have at least used
+a database at some point.  My hope is that this talk gives an interesting
+perspective about what&#39;s going on behind the scenes when you use a database
+API.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Agenda
+
+* Describe the Python DB-API
+* Describe the Comdb2 C API
+* Show how I bridged the divide
+
+<aside class="notes"><p>I&#39;m going to start by introducing the Python DB API, explaining what it&#39;s for,
+and explaining what&#39;s required for an API to conform to it.</p>
+<p>Then, I&#39;ll switch gears and talk about the C API exposed by Comdb2, the
+database database that I wrote an interface for, and talk about how I bridged
+the divide between the two interfaces.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### The Python DB API
+
+* PEP 249
+    - Python Database API specification v2.0
+* A recommended interface for DB modules
+    - Makes changing databases easier
+    - One primary module level function
+    - Two primary classes
+    - Three global variables
+    - Some exception types and utilities
+
+<aside class="notes"><p>So: what is the Python DB API?</p>
+<p>It&#39;s specified by PEP 249.</p>
+<p>It defines a common interface which database modules are encouraged to conform
+to.  The idea is that a developer can easily swap one database API out for
+another, as long as they both implement this interface.</p>
+<p>The API requires one top level function, two major classes, three global
+variables describing decisions made by the specific implementation, and a few
+exception types and other utilities.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### The top level function
+
+```py
+def connect(*args, **kwargs) -> Connection:
+```
+
+* Connects to a database
+* The parameters are not standardized
+* Returns a new `Connection`
+    - Or raises an `Error` if it can't
+
+<aside class="notes"><p>The module must provide a global function called <code>connect</code> that connects to
+a database.</p>
+<p>The parameters are not standardized; the DB-API has no opinions about what
+needs to be provided to create a new connection.  Depending on the particular
+DB:</p>
+<ul>
+<li>host/port</li>
+<li>username/password</li>
+<li>file on disk</li>
+<li>flag requesting an in-memory DB</li>
+</ul>
+<p>The standard only requires that it return a <code>Connection</code> - or raises an <code>Error</code>
+if it can&#39;t. Every method can raise <code>Error</code> instances.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### What's a `Connection`?
+
+```py
+class Connection:
+    def cursor(self) -> Cursor:
+    def commit(self) -> None:
+    def rollback(self) -> None:
+    def close(self) -> None:
+```
+
+* No public constructor (use `connect`)
+* Manages a stateful connection to a DB
+* Creates cursors leveraging that connection
+* Can apply or abort transactions
+
+<aside class="notes"><p>A cursor leverages this connection to talk to the DB. It is used to make
+queries, and to build up transactions (changesets that can contain many
+individual changes which will be applied atomically).  We&#39;ll talk more about
+cursors in a moment.</p>
+<p><code>commit</code> and <code>rollback</code> ask the DB to apply or discard the current transaction,
+respectively. If the DB doesn&#39;t support transactions, <code>rollback</code> must raise an
+exception and <code>commit</code> must do nothing.  If the DB does support transactions,
+a <code>commit</code> is required before any changes are persisted.</p>
+<p><code>close</code> closes a connection to the DB.  After <code>close</code>, no further operations
+can be performed on this connection or any cursor created by it, and any
+in-progress transaction is implicitly rolled back.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### What do I do with a `Cursor`?
+
+```py
+class Cursor:
+    def execute(self, sql: str, params=None) -> Any:
+    ...
+```
+
+* No public constructor
+* Manages the context of SQL statements
+* A `Connection` can have many cursors
+    - If so, they must not be isolated
+* `execute` asks the DB to run SQL
+    - *params* are variables for the query
+    - Return value is unspecified
+
+<aside class="notes"><p>A <code>Cursor</code> manages the context of a single statement at a time.</p>
+<p>It&#39;s possible to have multiple cursors associated with a single connection.  In
+that case they are not isolated from one another; changes made using one cursor
+must be immediately visible to queries made using another cursor on the same
+connection.</p>
+<p>The <code>execute</code> method requests the database to run an arbitrary SQL statement.
+The <code>params</code>, if any, are variables to be sent to the database alongside the
+statement.  Using parametrized statements generally improves performance, and
+helps to prevent SQL injection attacks.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### How do I use parameters?
+
+```sql
+paramstyle   Params     Placeholders
+qmark        Sequence   WHERE name=? and age=?
+format       Sequence   WHERE name=%s and age=%s
+numeric      Sequence   WHERE name=:1 and age=:2
+named        Mapping    WHERE name=:name and age=:age
+pyformat     Mapping    WHERE name=%(name)s and age=%(age)s
+```
+
+* Several placeholder formats are defined
+* A database API need only support one
+    - It sets `paramstyle` to tell users which
+* Parameter style defines two things
+    - SQL placeholder format
+    - Python type for `execute` _params_
+* _qmark_ and _format_ are discouraged
+
+<aside class="notes"><p>The <code>qmark</code>, <code>format</code>, and <code>numeric</code> parameter styles require parameters to be
+passed as a sequence of values.  For <code>qmark</code> and <code>format</code>, the 1st parameter
+in the sequence will be bound to the first placeholder in the string, the 2nd
+to the 2nd, and so on.  For <code>numeric</code>, the Nth parameter will be bound to :N.</p>
+<p>The <code>named</code> and <code>pyformat</code> parameter styles require parameters to be passed as
+a mapping of strings to values, with the string corresponding to one of the
+named placeholders.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### How do I get query results?
+
+```py
+class Cursor:
+    ...
+    def fetchone(self) -> Optional[Sequence]:
+    def fetchall(self) -> Sequence[Sequence]:
+    def fetchmany(self, n=None) -> Sequence[Sequence]:
+    ...
+```
+
+* A single row as a sequence of columns
+    - `None` if no rows remain
+* Or a sequence of all remaining rows
+* Or a sequence of up to _n_ remaining rows
+    - _n_ defaults to `self.arraysize`
+    - ... which defaults to 1
+* All 3 raise if no result set exists
+
+<aside class="notes"><p><code>execute</code> isn&#39;t required to return anything in particular.  Instead, result
+sets are exposed via three <code>fetch</code> methods.</p>
+<p><code>fetchone</code> returns the next row of the current result set as a Sequence, like
+a tuple or list, containing one element per returned column.</p>
+<p><code>fetchall</code> returns all remaining rows in the current result set as a Sequence
+of Sequences (like a list of tuples).  If no rows remain, an empty list is
+returned.</p>
+<p><code>fetchmany</code> behaves exactly like <code>fetchall</code> except that it will stop after
+fetching a user-specified number of rows, leaving any more sitting in the
+cursor for a future call to consume.  The max number of rows to return is
+given by the integer argument to <code>fetchmany</code>, and defaults to the cursor&#39;s
+<code>arraysize</code> property, which itself defaults to 1, but can be changed.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Result set introspection
+
+```py
+class Cursor:
+    ...
+    @property
+    def description(self) -> Sequence:
+    ...
+```
+
+* Property describing the current result set
+* Sequence containing 1 entry per column
+* Each column's entry is a 7 item sequence
+    - 2 mandatory items: name, type code
+    - 5 optional items: display size, internal size, precision, scale, nullable
+
+<aside class="notes"><p>A <code>Cursor</code> has a <code>description</code> property that describing the current result set.
+It is a sequence where the Nth element in the sequence describes the Nth
+column in the result set.  Each of those elements is itself a sequence of
+7 items, with the first being its name and the second being a type code for it.
+I&#39;m not going to say much about the type code because the PEP goes into a lot
+of detail on it; suffice it to say that the module must provide global
+variables like <code>STRING</code> and <code>NUMBER</code> that can be compared for equality against
+the type code to check if the returned column was of that type.  The other
+5 items in the 7-item sequence can be set to <code>None</code>; we&#39;ll just ignore them.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Any more introspection?
+
+```py
+class Cursor:
+    ...
+    @property
+    def rowcount(self) -> int:
+    ...
+```
+
+* For reads, the number of selected rows
+* For writes, the number of affected rows
+* -1 if the database can't answer the question
+* Can change when the DB learns the answer
+
+<aside class="notes"><p>Cursors have a <code>rowcount</code> property that tells the number of returned rows (for
+a read query) or the number of affected rows (for an update query).  Negative
+one can be returned if the database can&#39;t answer that question.  For some
+databases the number of affected rows isn&#39;t known until commit time, or the
+number of selected rows can&#39;t be determined until some rows have been fetched.
+The standard explicitly allows for <code>rowcount</code> to change after operations other
+than <code>execute</code> because of the latter case.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Calling stored procedures
+
+```py
+class Cursor:
+    ...
+    def callproc(self, procname, params) -> Sequence:
+    ...
+```
+
+* Not required
+* _procname_ is the procedure to call
+* _params_ is a sequence of parameter values
+* Returns a sequence
+    - A copy of the provided _params_
+    - but with output parameters overwritten
+* May also produce a result set
+
+<aside class="notes"><p>Since some databases don&#39;t support stored procedures, <code>callproc</code> isn&#39;t
+required.  If it&#39;s provided, you can use it to call a stored procedure.  It
+takes a procedure name and a sequence of parameter values, and returns a copy
+of that sequence with any OUTPUT parameters overwritten with values returned by
+the database.  It is allowed, though not required, to produce a result set.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Any more `Cursor` methods?
+
+```py
+class Cursor:
+    ...
+    def close(self) -> None:
+    def executemany(self, statements, params) -> Any:
+    def setinputsizes(self, sizes):
+    def setoutputsize(self, size, column=None):
+```
+
+* `close` stops you from using the cursor
+    - Does not roll back transactions
+* `executemany` runs several statements
+    - Takes sequences of statements/params
+    - No way to access result sets
+* And 2 methods not required to _do_ anything
+
+<aside class="notes"><p>&quot;OK, so that&#39;s executing statements, calling stored procedures, and handling
+result sets.  Is there anything else I can do with a cursor?&quot;</p>
+<p>You can execute multiple statements at once using <code>executemany</code>, which takes
+a sequence of statements and a corresponding sequence of parameter sets.  The
+specification provides no way to access the individual result sets, so this is
+only useful with statements that don&#39;t produce result sets.</p>
+<p>And there&#39;s 2 methods that are required, but aren&#39;t required to do anything.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### What else is in DB-API?
+
+* Required constructors for parameter values
+    - date
+    - time
+    - timestamp
+    - binary data (blob)
+* Exception hierarchy
+* Two more global variables
+    - _apilevel_ (always "2.0")
+    - _threadsafety_
+* Some optional extensions
+
+<aside class="notes"><p>There are some required constructors for creating parameter values suitable for
+passing to <code>execute</code>.  There&#39;s an exception hierarchy with different exceptions
+depending on what failed.  There&#39;s 2 more global variables, <code>apilevel</code> (which
+is &quot;2.0&quot; for DB-API 2.0), and <code>threadsafety</code> (which lets a module tell its
+users which operations are threadsafe).</p>
+<p>And that&#39;s everything that&#39;s required, though there are some optional
+extensions that are commonly implemented.</p>
+<p>-- 9 minutes so far. --</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Comdb2
+
+* I chose to wrap `libcdb2api`
+    - Using the wire protocol was considered
+* First I made a thin Cython layer over it
+* Then I built a DB-API module using that
+
+<aside class="notes"><p>Switching gears now: let&#39;s talk about Comdb2&#39;s C interface - or, at least,
+a minimal useful subset.  We chose to wrap the C library rather than
+re-implement the database&#39;s networking protocol, though of course that would have
+been an option as well.  We wrapped it in a thin, nearly 1-to-1 Cython layer
+and then used that layer from our DB-API 2.0 compliant module.  I won&#39;t mention
+that layer again, but you should know it&#39;s there.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### cdb2api Handles
+
+```c
+typedef struct cdb2_hndl cdb2_hndl_tp;
+
+int cdb2_open(cdb2_hndl_tp **hndl,
+              const char *dbname, const char *type, int flags);
+
+int cdb2_close(cdb2_hndl_tp *hndl);
+```
+
+* A handle type represents a DB connection
+* `cdb2_open` makes a new connection
+    - Parameters describe what DB to reach
+    - Return code indicates success or failure
+    - On success, a new handle is returned
+* `cdb2_close` disconnects and frees handles
+
+<aside class="notes"><p>Similar to DB-API&#39;s <code>Connection</code> is cdb2api&#39;s &quot;handle&quot;.  You pass some
+parameters to <code>cdb2_open</code> describing the database connection you want to
+establish, and it returns an integer return code indicating whether the
+operation succeeded, and fills in a pointer to a newly allocated handle if so.
+Once you&#39;re done with that handle, you&#39;re expected to call <code>cdb2_close</code> on it,
+which closes the connection and frees the handle.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### DB-API `connect`
+
+```c
+int cdb2_open(cdb2_hndl_tp **hndl,
+              const char *dbname, const char *type, int flags);
+```
+```py
+def connect(*args, **kwargs) -> Connection:
+```
+
+* `cdb2_open` aligns nicely with DB-API
+* `connect` forwards `cdb2_open` params along
+* `cdb2_open` connects and returns a handle
+* `Connection` owns and manages the handle
+
+<aside class="notes"><p>This lines up pretty well with the DB-API.  Our <code>connect()</code> factory function
+takes the same <code>dbname</code>, <code>type</code>, and <code>flags</code> parameters that <code>cdb2_open</code> takes,
+and just passes them right along.  <code>cdb2_open</code> creates a new handle for us, and
+we return the user a <code>Connection</code> object that encapsulates that handle.  So
+far, so good.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### DB-API `close`
+
+```c
+int cdb2_close(cdb2_hndl_tp *hndl);
+```
+```py
+class Connection:
+    def close(self) -> None:
+```
+
+* Disconnecting lines up nicely as well
+* `Connection.close()` closes its handle
+* So does `Connection.__del__()`
+
+<aside class="notes"><p>Closing a Connection also closes the handle it owns - and we add a <code>__del__</code>
+method to close the handle in case the user fails to close the connection.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Cursors in Comdb2
+
+* Don't exist as distinct from connections
+    - The DB's protocol isn't multiplexed
+    - Connections are isolated
+    - Each cdb2api handle owns 1 connection
+* DB-API requires us to emulate cursors
+    - Many cursors for 1 connection
+    - Those cursors aren't isolated
+
+<aside class="notes"><p>Cursors are our first speed bump.  cdb2api doesn&#39;t expose cursors to the user.
+It exposes some operations that are cursor-like, but there&#39;s no way to get
+a second cursor for a handle, or to use a single connection to run multiple
+simultaneous statements.  Connections are meant to be cheap, and you&#39;re meant
+to just get another one to run a second query.</p>
+<p>If we were to push everything down a level and make our DB-API <code>Cursor</code> class
+own the DB connection instead, we wouldn&#39;t be able to make cursors for one
+connection share uncommitted transactions, as the DB-API requires.</p>
+<p>So, what do we do about that?</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### DB-API `cursor`
+
+```py
+class Connection:
+    def cursor(self) -> Cursor:
+        self._close_any_outstanding_cursor()
+        cursor = Cursor(self)
+        self._active_cursor = weakref.ref(cursor)
+        return cursor
+```
+
+* We cheat.
+* Opening a new cursor? Close any old one.
+* Every alternative is worse.
+
+<aside class="notes"><p>We cheat.  Every time a new cursor is created for a connection, we invalidate
+any previous cursor for it.  If the user attempts to use the original cursor
+after that point, they&#39;ll get the same error as they would get if they had
+called <code>close</code> on it themselves.</p>
+<p>This is ugly, but every alternative we considered is further from the required
+behavior than this (and since the spec specifically mentions that implementers
+may need to emulate cursors, this isn&#39;t completely out there).</p>
+<p>The standard really only says that the user has to be able to <em>create</em> multiple
+cursors; it doesn&#39;t say they have to be able to <em>use</em> them all - right?  Of
+course right!</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Running SQL with cdb2api
+
+```c
+int cdb2_run_statement(cdb2_hndl_tp *hndl, const char *sql);
+
+const char *cdb2_errstr(cdb2_hndl_tp *hndl);
+```
+
+* `cdb2_run_statement` sends SQL to the DB
+    - Return code tells if it succeeded
+* After an error, call `cdb2_errstr`
+    - It gives human readable error messages
+
+<aside class="notes"><p>You execute a SQL statement on a handle by calling <code>cdb2_run_statement</code>, which
+returns an error code to tell you if it succeeded.  If a query has failed, you
+can get a human-readable error message for it with <code>cdb2_errstr</code>.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### DB-API `execute`
+
+```c
+int cdb2_run_statement(cdb2_hndl_tp *hndl, const char *sql);
+```
+```py
+class Cursor:
+    def execute(self, sql: str, params=None) -> Any:
+```
+
+* Let's ignore _params_ for the moment
+* This maps well!
+* `execute` forwards to `cdb2_run_statement`
+* An exception is raised on failure
+* We use `cdb2_errstr` for the error message
+</script></section><section  data-markdown><script type="text/template">
+### Raising exceptions
+
+```none
++-- Error
+     +-- InterfaceError
+     +-- DatabaseError
+          +-- DataError
+          +-- OperationalError
+          +-- IntegrityError
+          |    +-- UniqueKeyConstraintError
+          |    +-- ForeignKeyConstraintError
+          |    +-- NonNullConstraintError
+          +-- InternalError
+          +-- ProgrammingError
+          +-- NotSupportedError
+```
+
+* Every cdb2api error code maps unambiguously to a DB-API `Exception`
+
+<aside class="notes"><p>Comdb2 error codes map up nicely to DB-API exceptions.  Every cdb2api return
+code maps to one, and only one, of the exception types mandated by the DB-API.</p>
+<p>We raise an <code>InterfaceError</code> when the user has misused our API, and
+a <code>DatabaseError</code> for any error reported to us by a cdb2api call.</p>
+<p><code>DataError</code> is raised if you try to write a value to a column that doesn&#39;t
+conform to its schema.</p>
+<p><code>OperationalError</code> is raised for things like broken network connections.</p>
+<p><code>IntegrityError</code> is raised if the given SQL transaction would violate table
+constraints.</p>
+<p><code>ProgrammingError</code> is raised for invalid SQL syntax.</p>
+<p>And in all of these cases, the cdb2api return code is sufficiently precise to
+allow us to easily determine which of these categories each error fell into,
+and <code>cdb2_errstr</code> gives us a useful message to show the user.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Transactions in Comdb2
+
+```c
+cdb2_run_statement(hndl, "begin")
+cdb2_run_statement(hndl, "update table set name='matt'")
+cdb2_run_statement(hndl, "commit") // or "rollback"
+```
+
+* Statements commit automatically by default
+* Transactions are opt-in (execute BEGIN)
+    - Run BEGIN to start one
+    - End it with COMMIT or ROLLBACK
+
+<aside class="notes"><p>Remember that DB-API requires that every statement be part of a transaction by
+default.  The SQL specification, on the other hand, requires a BEGIN statement
+to be issued to start a new transaction.</p>
+<p>By default, Comdb2 will automatically commit after each statement.  To get
+multi-statement transactions, you need to run a &quot;BEGIN&quot; statement.  You end the
+transaction by issuing a &quot;COMMIT&quot; or &quot;ROLLBACK&quot; statement (or closing the
+connection for an implicit rollback).</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### DB-API `commit` / `rollback`
+
+```py
+class Connection:
+    def commit(self) -> None:
+    def rollback(self) -> None:
+```
+
+* Automatic BEGIN in `Cursor.execute`
+    - Run before the user's statement
+    - Unless we're in a transaction already
+    - Not before SET statements
+* Prevent BEGIN / COMMIT / ROLLBACK
+* Then `commit` and `rollback` are easy
+    - Just call `cdb2_run_statement`
+
+<aside class="notes"><p>OK, we can handle this: we add some more complexity into <code>Cursor.execute</code>.
+Before sending a statement to the DB, if we haven&#39;t yet started a new
+transaction, we&#39;ll send a BEGIN.  We&#39;ll do this both for the first statement we
+send, and whenever a new statement is sent after a call to <code>commit()</code> or
+<code>rollback()</code> ends a transaction.</p>
+<p>As an exception, we&#39;ll allow SET statements through without running BEGIN
+first.  There are certain things that Comdb2 requires to be done outside of
+a transaction.  Things like, for instance (and probably for obvious reasons),
+configuring the isolation level.  Once the transaction has been started, it&#39;s
+too late to say &quot;and I want my transaction to be in SERIALIZABLE mode&quot;.  So, we
+also have to detect SET statements and let them pass through to the DB without
+sending a BEGIN.</p>
+<p>We also block users from executing BEGIN or COMMIT or ROLLBACK statements,
+forcing them to use the DB-API methods for these things instead.</p>
+<p>After adding this to <code>Cursor.execute</code>, implementing <code>commit</code> and <code>rollback</code> is
+trivial: just call <code>cdb2_run_statement</code> with COMMIT or ROLLBACK as the SQL.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Parametrized SQL in cdb2api
+
+```c
+int cdb2_bind_param(cdb2_hndl_tp *hndl,
+                    const char *name, int type,
+                    const void *varaddr, int length);
+int cdb2_clearbindings(cdb2_hndl_tp *hndl);
+```
+
+* Parameters are set on the handle
+* Each has a name, type code, and value
+    - Names match placeholders in the SQL
+    - Types are enumerated
+    - User gives a pointer to a valid value of the given type, and its length
+* Parameters persist until cleared
+
+<aside class="notes"><p>Parameters are registered with the handle in advance by calls to
+<code>cdb2_bind_param</code>, which takes a name (like the name used in the <code>paramstyle</code>
+formats that take a Mapping), a type code, and a pointer to an object of that
+type along with its size (for variable-length things like strings and blobs).
+Any parameters that you&#39;ve bound with calls to <code>cdb2_bind_param</code> will be sent
+along with all future queries until you explicitly remove them with a call to
+<code>cdb2_clearbindings</code>.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### DB-API parameter support
+
+* Our first hurdle is Comdb2's placeholders
+    - `select name where age=@age`
+* That's not a DB-API `paramstyle`
+* We'll need to pick one and rewrite the SQL
+* We'd very much prefer to avoid parsing SQL
+</script></section><section  data-markdown><script type="text/template">
+### Picking a `paramstyle`
+
+```sql
+-- qmark
+update table set age=? where pet='?'
+```
+```sql
+-- format
+update table set age=%s where pet='%s'
+```
+```sql
+-- numeric
+update table set age=:1 where pet=':2'
+```
+```sql
+-- named
+update table set age=:age where pet=':pet'
+```
+```sql
+-- pyformat
+update table set age=%(a)s where pet='%%(p)s'
+```
+
+<aside class="notes"><p>The PEP explicitly recommends against <em>qmark</em> and <em>format</em>, so those are out.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Picking a `paramstyle`
+
+```sql
+-- qmark: explicitly discouraged
+update table set age=? where pet='?'
+```
+```sql
+-- format: explicitly discouraged
+update table set age=%s where pet='%s'
+```
+```sql
+-- numeric
+update table set age=:1 where pet=':2'
+```
+```sql
+-- named
+update table set age=:age where pet=':pet'
+```
+```sql
+-- pyformat
+update table set age=%(a)s where pet='%%(p)s'
+```
+
+<aside class="notes"><p>And <em>named</em> and <em>numeric</em> give no way to know whether a particular string
+starting with a colon is a placeholder or part of a string literal without
+parsing the query, so those don&#39;t meet our &quot;don&#39;t require a SQL parser&quot; goal.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Picking a `paramstyle`
+
+```sql
+-- qmark: explicitly discouraged
+update table set age=? where pet='?'
+```
+```sql
+-- format: explicitly discouraged
+update table set age=%s where pet='%s'
+```
+```sql
+-- numeric: requires a SQL parser
+update table set age=:1 where pet=':2'
+```
+```sql
+-- named: requires a SQL parser
+update table set age=:age where pet=':pet'
+```
+```sql
+-- pyformat: winner!
+update table set age=%(a)s where pet='%%(p)s'
+```
+
+<aside class="notes"><p>But, hey!  Look at <code>pyformat</code>!  (And, incidentally, <code>format</code> as well.)  Since
+those two are intended to be valid Python format strings, the user is forced to
+escape extra percent signs that aren&#39;t meant to be used for placeholders.  This
+means that we don&#39;t need to parse the SQL to determine what is or isn&#39;t
+a placeholder, because the user is required to write something unambiguous in
+the first place.</p>
+<p>With this responsibility pushed off to the user, choosing <code>pyformat</code> actually
+gives us a simple solution to our placeholder woes:</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### SQL placeholder rewrite
+
+```py
+sql = sql % {name: "@" + name for name in parameters}
+```
+
+* Leverage Python string formatting
+* Replace all `%(foo)s` with `@foo`
+    - Take the keys in the user supplied dict
+    - Use them as the keys for formatting
+    - Prepend '@' to them as the replacements
+
+<aside class="notes"><p>We take the parameters that the user gave us, and create a new dict mapping
+name to @name.  Then, we interpolate that into a pyformat style string, and
+we&#39;re done!  The user is responsible for escaping percent signs that aren&#39;t
+placeholders, Python is responsible for parsing that string, finding the
+<em>pyformat</em> placeholders, and replacing them with the Comdb2 placeholders, and
+no SQL needed to be parsed.  That&#39;s almost elegant!</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Parameter type mapping
+
+| Python            | Comdb2   |
+| ----------------- | -------- |
+| None              | NULL     |
+| int               | integer  |
+| float             | real     |
+| bytes             | blob     |
+| str               | text     |
+| datetime.datetime | datetime |
+
+<aside class="notes"><p>Now, the user needs to give us a dictionary mapping parameter names to values.
+The first thing we need to do is figure out what Comdb2 type each of those
+values should be bound as.  Fortunately, that&#39;s pretty straightforward - for
+almost every SQL type supported by Comdb2, there&#39;s a single builtin Python type
+that neatly corresponds to it.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Parameter binding
+
+```c
+int cdb2_bind_param(cdb2_hndl_tp *hndl,
+                    const char *name, int type,
+                    const void *varaddr, int length);
+
+int cdb2_clearbindings(cdb2_hndl_tp *hndl);
+```
+
+* Loop over the provided parameters
+* Determine Comdb2 types from Python types
+* Create temporary variables for params
+    - Copy the Python values into them
+    - Or point to Python buffers
+* Bind them with `cdb2_bind_param`
+* Clear bindings after each execute
+
+<aside class="notes"><p>Now that we&#39;ve massaged the SQL string to have the placeholders Comdb2 expects,
+the next step is to bind the parameter values.  We loop over the user-provided
+parameter dict, calling <code>cdb2_bind_param</code> once for each parameter.</p>
+<p>We use the type of the Python value to decide which type code to pass to
+<code>cdb2_bind_param</code>.  We copy its value into an object of the type that the
+native API expects (from Python&#39;s arbitrary precision integer into a 64-bit
+integer, for example).  For <code>bytes</code> and <code>str</code>, we can just pass along a pointer
+to data held by the Python object, rather than copying it out - nice.</p>
+<p>After we&#39;ve made all of our calls to <code>cdb2_bind_param</code>, we call
+<code>cdb2_run_statement</code> to send the rewritten statement to the database along with
+the parameters.  As soon as that call finishes, regardless of whether it
+succeeded, we clear the parameters with <code>cdb2_clearbindings</code>.  Parameters being
+&quot;sticky&quot; isn&#39;t a useful feature to us.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Column metadata in cdb2api
+
+```c
+int cdb2_numcolumns(cdb2_hndl_tp *hndl);
+
+const char *cdb2_column_name(cdb2_hndl_tp *hndl, int col);
+
+int cdb2_column_type(cdb2_hndl_tp *hndl, int col);
+```
+
+* `cdb2_numcolumns` gives the result set width
+* `cdb2_column_name` gives a column's name
+* `cdb2_column_type` gives a column's type
+    - Uses the same type codes as parameters
+
+<aside class="notes"><p>After running a query you can introspect the result set it returns.</p>
+<p><code>cdb2_numcolumns</code> tells you how many columns wide the result set is,
+<code>cdb2_column_name</code> tells you the name of each column, <code>cdb2_column_type</code> tells
+you the type of value returned in that column (using the same type enumeration
+I mentioned earlier).</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### DB-API `description`
+
+```c
+int cdb2_numcolumns(cdb2_hndl_tp *hndl);
+const char *cdb2_column_name(cdb2_hndl_tp *hndl, int col);
+int cdb2_column_type(cdb2_hndl_tp *hndl, int col);
+```
+```py
+class Cursor:
+    @property
+    def description(self):
+```
+
+* Find number of columns
+* Find Python type code given Comdb2 type
+* Fill _name_ and _type_ in for each column
+* Set the other 5 fields `None`
+* Set `description` to `None` for updates
+
+<aside class="notes"><p>After parameters, this looks like child&#39;s play.  We know how many columns
+a result set has, and what their names are, and what Comdb2 type each has.  The
+same one-to-one mapping of Python type to Comdb2 type applies in the reverse
+direction, so we can easily build up the <code>description</code> property.  All we&#39;re
+left to do is map the Comdb2 type back to one of the module-global type codes
+required by the DB-API.</p>
+<p>Oh, and there&#39;s one other complication: the DB-API spec requires the
+<code>description</code> property to be set to <code>None</code> if the operation doesn&#39;t produce
+a result set, and cdb2api doesn&#39;t give us any way to distinguish between, for
+instance, a query that returned no rows vs an update statement that <em>cannot</em>
+return rows.  Oh well, we were already trying to guess what type of operation
+the SQL statement was; now we have to look for things like INSERT and UPDATE
+and DELETE and handle them by setting <code>description</code> to <code>None</code>.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Result sets in cdb2api
+
+```c
+int cdb2_next_record(cdb2_hndl_tp *hndl);
+void *cdb2_column_value(cdb2_hndl_tp *hndl, int col);
+int cdb2_column_size(cdb2_hndl_tp *hndl, int col);
+```
+
+* `cdb2_next_record` advances to the next row
+    - Can succeed with `OK` or `OK_DONE` (or fail)
+* `cdb2_column_value` gets a column's value
+    - The type must be known to interpret it
+    - Invalidated by next `cdb2_next_record`
+* `cdb2_column_size` gets a column's size
+    - Only needed for variable-width types
+
+<aside class="notes"><p>Once you&#39;ve run a query, you need to get its result set.  That&#39;s done calling
+<code>cdb2_next_record</code> to iterate over each result row.  It returns an error code
+that either tells you that it has successfully advanced the handle&#39;s internal
+cursor to point to the next row of the result set, or that it has successfully
+advanced the cursor past the end of the result set and no rows are left to
+consume, or that some error has occurred.</p>
+<p>Once you&#39;ve advanced the cursor to a row in the result set, you can use
+<code>cdb2_column_value</code> to get pointers to the value of each column on that row.
+You&#39;ll need to know what type the returned column was to know what to do with
+that pointer.  For some types the size of the resulting value is implied by the
+type, but for others, specifically strings and blobs, the length is variable
+and you need to use <code>cdb2_column_size</code> to check how many bytes you should read
+from the returned pointer.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### DB-API `fetch` methods
+
+```c
+int cdb2_next_record(cdb2_hndl_tp *hndl);
+void *cdb2_column_value(cdb2_hndl_tp *hndl, int col);
+int cdb2_column_size(cdb2_hndl_tp *hndl, int col);
+```
+```py
+class Cursor:
+    def fetchone(self) -> Optional[Sequence]:
+    def fetchall(self) -> Sequence[Sequence]:
+    def fetchmany(self, n=None) -> Sequence[Sequence]:
+```
+
+* `fetchall` and `fetchmany` call `fetchone`
+* Advance the cursor
+* Raise if this failed
+* Return `None` if this said `OK_DONE`
+* Map column values to Python
+    - Inverse of what we did for params
+
+<aside class="notes"><p>These map pretty nicely!  We can simplify things by implementing <code>fetchall</code> and
+<code>fetchmany</code> in terms of <code>fetchone</code>.  Comdb2 manages its buffering internally;
+there&#39;s no way to request more than one row at a time from it, so there&#39;s no
+disadvantage to implementing those two routines as calls to <code>fetchone</code> in
+a loop.</p>
+<p><code>fetchone</code>, then, needs to advance the handle&#39;s cursor to the next record,
+return <code>None</code> if that operation fails with a return code indicating that no
+more records exist, and otherwise construct a sequence to return.  We already
+know the number and type of each column, so we can loop over them, getting the
+column value and (for strings and blobs) the size, and copy them back in the
+other direction, from the C type to the Python type.  Since there is a clean,
+1-to-1 mapping of Comdb2 type to Python type, this is pretty easy to do.  In
+this direction we need to copy the data even for strings and blobs, because the
+library owns the memory that <code>cdb2_column_value</code> returns to us and it would be
+freed - or overwritten with different values - on the next call to
+<code>cdb2_next_record</code>.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Affected rows in cdb2api
+
+```c
+typedef struct cdb2_effects_type {
+    int num_affected;
+    int num_selected;
+    int num_updated;
+    int num_deleted;
+    int num_inserted;
+} cdb2_effects_tp;
+
+int cdb2_get_effects(cdb2_hndl_tp *hndl, cdb2_effects_tp *ret);
+```
+
+* You can ask for counts of affected rows
+* This consumes any outstanding result set
+    - Result set sizes aren't precomputed
+* By default, not useful in transactions
+    - Affected rows aren't known until commit
+
+<aside class="notes"><p>After a query is executed you can also ask for a count of affected rows, which
+are even able to be broken down into counts of selected rows, vs updated rows,
+vs deleted, vs inserted.  But, there&#39;s a catch: calling <code>cdb2_get_effects</code>
+consumes any current result set.  That&#39;s because Comdb2 starts returning rows
+to the user before it knows how many total rows matched the query; it can&#39;t
+tell you how many rows were selected except by counting the number of rows
+that were sent back!  This will come up again later...</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### DB-API `rowcount`
+
+```c
+int cdb2_get_effects(cdb2_hndl_tp *hndl, cdb2_effects_tp *effects);
+```
+```py
+class Cursor:
+    @property
+    def rowcount(self) -> int:
+```
+
+* Must `commit` to find num affected
+    - Optimistic Concurrency Control
+* Must consume results to find num selected
+* Those aren't expected for `rowcount`
+* But we're allowed to say "I don't know"
+    - Set `rowcount` to `-1` after `execute`
+    - Fix it after `commit`
+
+<aside class="notes"><p>And speaking of INSERT and UPDATE and DELETE - interestingly, the
+<code>cdb2_get_effects</code> call doesn&#39;t really return reliable results inside
+a transaction, and DB-API requires that we always be in a transaction.  Comdb2
+has what&#39;s called Optimistic Concurrency Control, meaning that statements
+don&#39;t need to acquire locks, and conflicts between statements are handled at
+commit time.  Normally Comdb2 handles that by backing off and retrying the
+statement if it detects that it raced with another transaction, but the second
+time around it might find a different set of rows to modify, since that other
+transaction could have modified the rows it was originally looking at!
+Between that, and the fact that calling <code>cdb2_get_effects</code> consumes any
+outstanding result set, it means that we can really only give a reliable
+<code>rowcount</code> after a COMMIT.  But, fortunately, that&#39;s legal per the spec.  We
+set this to -1 after every statement, but update it to the true count of
+affected rows once a transaction is committed.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Anything else?
+
+```py
+class Cursor:
+    def executemany(self, statements, params) -> Any:
+    def setinputsizes(self, sizes):
+    def setoutputsize(self, size, column=None):
+    def callproc(self, procname, params) -> Sequence:
+```
+
+* `executemany` loops calling `execute`
+* `setinputsizes` is a no-op
+* `setoutputsize` is a no-op
+* `callproc` leverages `execute`
+    - Comdb2 doesn't have output parameters
+
+<aside class="notes"><p>And that&#39;s pretty much everything interesting.  We implement <code>executemany</code> by
+just calling <code>execute</code> in a loop.  We implement <code>setinputsizes</code> and
+<code>setoutputsize</code> with an empty body; they do nothing except raise an exception
+if they&#39;re called on an already-closed cursor.  And, while Comdb2 does support
+stored procedures, they don&#39;t have output parameters - they always produce
+output as result sets.  So, <code>callproc</code> can return a copy of the input
+parameters unchanged, and internally just delegates to <code>execute</code> to ask the DB
+to run the procedure.</p>
+<p>I know that this talk went very quickly over a whole lot of stuff, but I hope
+that you found it interesting - it was a very fun challenge for me.  This all
+works surprisingly well considering some of the unorthodox hacks; we were able
+to get <code>SqlAlchemy</code> working with this module with pretty minimal effort.</p>
+</aside></script></section><section  data-markdown><script type="text/template">
+### Questions?
+
+<aside class="notes"><p>Thanks for listening to me!  Do I have any time for questions?</p>
+</aside></script></section></div>
+
+
+      <div style="position: absolute; bottom: 0px; left: 5px;">
+        <svg xmlns="http://www.w3.org/2000/svg" width="300.005" height="60.469" viewBox="0 0 300.005 60.469" overflow="visible"><path fill="#808080" d="M7.897 7.813h6.52c5.959 0 8.585 1.883 8.585 5.708 0 3.324-2.626 5.581-7.897 5.581h-7.208v-11.289zm-7.897 37.61h15.98c8.398 0 16.796-3 16.796-12.657 0-5.708-4.002-10.09-9.579-10.724v-.132c4.563-1.367 7.71-4.69 7.71-9.706 0-8.088-6.903-11.157-13.61-11.157h-17.297v44.376zm7.897-19.555h7.582c6.392 0 9.411 1.632 9.411 6.274 0 5.821-5.654 6.515-9.726 6.515h-7.267v-12.789z"/><path stroke="#808080" stroke-width="7.5" stroke-miterlimit="10" fill="none" d="M41.706 45.423v-45.423"/><path fill="#808080" d="M58.011 30.382c0-4.701 3.324-9.022 8.841-9.022 5.517 0 8.831 4.322 8.831 9.022s-3.314 9.023-8.831 9.023c-5.518 0-8.841-4.322-8.841-9.023m-7.523 0c0 9.465 7.267 15.789 16.364 15.789 9.086 0 16.364-6.323 16.364-15.789s-7.277-15.798-16.364-15.798c-9.097-.001-16.364 6.333-16.364 15.798M94.131 30.382c0-4.701 3.324-9.022 8.841-9.022 5.517 0 8.831 4.322 8.831 9.022s-3.314 9.023-8.831 9.023c-5.517 0-8.841-4.322-8.841-9.023m-7.523 0c0 9.465 7.268 15.789 16.364 15.789 9.086 0 16.364-6.323 16.364-15.789s-7.277-15.798-16.364-15.798c-9.097-.001-16.364 6.333-16.364 15.798"/><path fill="#808080" d="M123.918 15.336h7.149v4.706h.118c1.318-2.822 4.199-5.463 9.214-5.463 4.642 0 7.848 1.814 9.411 5.581 2.193-3.816 5.389-5.581 9.893-5.581 8.024 0 10.848 5.713 10.848 12.922v17.923h-7.523v-17.048c0-3.757-1.121-7.017-5.576-7.017-4.7 0-6.461 3.884-6.461 7.764v16.3h-7.513v-17.923c0-3.708-1.505-6.141-5.143-6.141-4.947 0-6.894 3.624-6.894 7.641v16.423h-7.523v-30.087zM201.597 30.382c0 4.706-3.314 9.023-8.841 9.023-5.518 0-8.841-4.317-8.841-9.023 0-4.701 3.323-9.033 8.841-9.033 5.527 0 8.841 4.332 8.841 9.033m-24.949 15.041h7.149v-4.51h.118c2.202 3.624 6.146 5.257 10.354 5.257 9.264 0 14.85-6.894 14.85-15.789 0-8.9-5.959-15.798-14.544-15.798-5.636 0-8.654 2.626-10.218 4.583h-.187v-19.166h-7.523v45.423zM220.045 27.373c.561-4.332 3.324-7.149 7.769-7.149 4.701 0 7.582 2.759 7.651 7.149h-15.42zm22.943 5.64v-2.065c0-10.473-5.703-16.364-14.102-16.364-9.106 0-16.364 6.333-16.364 15.798s7.258 15.789 16.364 15.789c4.75 0 9.214-1.691 12.715-6.009l-5.389-4.066c-1.878 2.307-4.327 4.066-8.084 4.066-4.198 0-7.592-2.699-8.083-7.149h22.943zM247.885 15.336h7.523v4.765h.128c1.632-3.447 4.946-5.522 8.899-5.522.944 0 1.819.192 2.694.447v7.268c-1.249-.31-2.448-.561-3.639-.561-7.08 0-8.083 5.959-8.083 7.592v16.099h-7.523v-30.088zM283.957 21.359c5.448 0 8.899 3.624 8.899 8.84 0 5.006-3.383 8.831-8.959 8.831-5.074 0-8.841-3.948-8.841-8.713 0-5.334 3.629-8.958 8.901-8.958m8.899-6.023v4.514h-.118c-2.202-3.639-6.155-5.271-10.354-5.271-9.273 0-14.85 6.898-14.85 15.803 0 8.516 5.959 15.415 14.978 15.415 3.766 0 7.65-1.436 9.854-4.381h.107v2.198c0 5.949-2.242 10.09-9.519 10.09-4.199 0-7.337-1.574-10.346-4.347l-4.504 6.155c4.248 3.776 9.332 4.957 14.918 4.957 11.723 0 16.983-6.903 16.983-17.741v-27.392h-7.149z"/></svg>
+      </div>
+      <span style="position: absolute; bottom: 4px; left: 5px; color: #010101; font-size: 10px;">
+        &copy; 2019 Bloomberg Finance L.P. All rights reserved.
+      </span>
+    </div>
+
+    <script src="./lib/js/head.min.js"></script>
+    <script src="./js/reveal.js"></script>
+
+    <script>
+      function extend() {
+        var target = {};
+        for (var i = 0; i < arguments.length; i++) {
+          var source = arguments[i];
+          for (var key in source) {
+            if (source.hasOwnProperty(key)) {
+              target[key] = source[key];
+            }
+          }
+        }
+        return target;
+      }
+      // Optional libraries used to extend on reveal.js
+      var deps = [
+        { src: './lib/js/classList.js', condition: function() { return !document.body.classList; } },
+        { src: './plugin/markdown/marked.js', condition: function() { return !!document.querySelector('[data-markdown]'); } },
+        { src: './plugin/markdown/markdown.js', condition: function() { return !!document.querySelector('[data-markdown]'); } },
+        { src: './plugin/highlight/highlight.js', async: true, callback: function() { hljs.initHighlightingOnLoad(); } },
+        { src: './plugin/zoom-js/zoom.js', async: true },
+        { src: './plugin/notes/notes.js', async: true },
+        { src: './plugin/math/math.js', async: true }
+      ];
+      // default options to init reveal.js
+      var defaultOptions = {
+        controls: true,
+        progress: true,
+        history: true,
+        center: true,
+        transition: 'none', // none/fade/slide/convex/concave/zoom
+        dependencies: deps
+      };
+      // options from URL query string
+      var queryOptions = Reveal.getQueryHash() || {};
+      var options = extend(defaultOptions, {}, queryOptions);
+    </script>
+    <style>
+      img[alt=terminal] {
+          width: 450px;
+          margin-bottom: 0px !important;
+      }
+      .container {
+          display: flex;
+      }
+      .col {
+          flex: 1;
+      }
+    </style>
+
+
+    <script>
+      Reveal.initialize(options);
+    </script>
+  </body>
+</html>
