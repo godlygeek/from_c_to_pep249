@@ -17,14 +17,14 @@
 ### A Database API Odyssey
 Matt Wozniski (Bloomberg)
 
-<aside class="notes"><p>Hi - I&#39;m Matt Wozniski.  I work for Bloomberg, and I&#39;m going to talk to you
-about my experiences adapting Comdb2, an open source distributed relational
-database system that we created, to the Python DB API.  I realize that most
-developers will never need to implement a new database interface, and that this
-topic is therefore a bit in the weeds, but most developers have at least used
-a database at some point.  My hope is that this talk gives an interesting
-perspective about what&#39;s going on behind the scenes when you use a database
-API.</p>
+<aside class="notes"><p>Hi. My name is Matt Wozniski, and my talk is &quot;From C to PEP-249: A Database API
+Odyssey&quot;.  I work for Bloomberg, and I&#39;m going to be talking about my
+experiences adapting Comdb2, a distributed relational database we created and
+open sourced, to the Python DB API.</p>
+<p>Since most people will never write a new database API I realize that this topic
+is a bit in the weeds, but I&#39;m hoping it serves as a useful introduction to the
+Python DB-API, and also gives some interesting perspective about what&#39;s going
+on behind the scenes when you use a database API.</p>
 </aside></script></section><section  data-markdown><script type="text/template">
 ### Agenda
 
@@ -33,10 +33,9 @@ API.</p>
 * Show how I bridged the divide
 
 <aside class="notes"><p>I&#39;m going to start by introducing the Python DB API, explaining what it&#39;s for,
-and explaining what&#39;s required for an API to conform to it.</p>
-<p>Then, I&#39;ll switch gears and talk about the C API exposed by Comdb2, the
-database database that I wrote an interface for, and talk about how I bridged
-the divide between the two interfaces.</p>
+and explaining what it means for a database interface to conform to it.</p>
+<p>Then, I&#39;ll switch gears and talk about the C API exposed by Comdb2, and talk
+about how I bridged the divide between the two interfaces.</p>
 </aside></script></section><section  data-markdown><script type="text/template">
 ### The Python DB API
 
@@ -52,8 +51,8 @@ the divide between the two interfaces.</p>
 <aside class="notes"><p>So: what is the Python DB API?</p>
 <p>It&#39;s specified by PEP 249.</p>
 <p>It defines a common interface which database modules are encouraged to conform
-to.  The idea is that a developer can easily swap one database API out for
-another, as long as they both implement this interface.</p>
+to.  The idea is that a developer can easily swap one database out for
+another, as long as both their APIs implement this common interface.</p>
 <p>The API requires one top level function, two major classes, three global
 variables describing decisions made by the specific implementation, and a few
 exception types and other utilities.</p>
@@ -71,17 +70,18 @@ def connect(*args, **kwargs) -> Connection:
 
 <aside class="notes"><p>The module must provide a global function called <code>connect</code> that connects to
 a database.</p>
-<p>The parameters are not standardized; the DB-API has no opinions about what
-needs to be provided to create a new connection.  Depending on the particular
-DB:</p>
+<p>The parameters are not standardized.  Depending on the particular DB:</p>
 <ul>
 <li>host/port</li>
 <li>username/password</li>
 <li>file on disk</li>
-<li>flag requesting an in-memory DB</li>
+<li>flag requesting an anonymous in-memory DB</li>
 </ul>
-<p>The standard only requires that it return a <code>Connection</code> - or raises an <code>Error</code>
-if it can&#39;t. Every method can raise <code>Error</code> instances.</p>
+<p>The only requirement that the standard imposes is that it must return
+a <code>Connection</code> object if a connection could be successfully established, and
+raise an <code>Error</code> if it couldn&#39;t.</p>
+<p>Note that <code>Error</code> is a subclass of <code>Exception</code> required to be provided by the
+module; every method can raise <code>Error</code> instances to report failures.</p>
 </aside></script></section><section  data-markdown><script type="text/template">
 ### What's a `Connection`?
 
@@ -98,17 +98,19 @@ class Connection:
 * Creates cursors leveraging that connection
 * Can apply or abort transactions
 
-<aside class="notes"><p>A cursor leverages this connection to talk to the DB. It is used to make
-queries, and to build up transactions (changesets that can contain many
-individual changes which will be applied atomically).  We&#39;ll talk more about
-cursors in a moment.</p>
+<aside class="notes"><p>The <code>Connection</code> it returns represents a stateful, persistent connection to the
+DB.  It acts as a factory for cursors, which leverage the connection to talk to
+the DB.</p>
+<p>Cursors are used to make queries, and to build up transactions (changesets that
+can contain many individual changes which will be applied atomically).  I&#39;ll
+talk more about cursors in a moment.</p>
 <p><code>commit</code> and <code>rollback</code> ask the DB to apply or discard the current transaction,
 respectively. If the DB doesn&#39;t support transactions, <code>rollback</code> must raise an
-exception and <code>commit</code> must do nothing.  If the DB does support transactions,
-a <code>commit</code> is required before any changes are persisted.</p>
-<p><code>close</code> closes a connection to the DB.  After <code>close</code>, no further operations
-can be performed on this connection or any cursor created by it, and any
-in-progress transaction is implicitly rolled back.</p>
+exception each time it&#39;s called, and <code>commit</code> must do nothing.  If the DB does
+support transactions, no changes can be persisted unless <code>commit</code> is called.</p>
+<p><code>close</code> closes a connection.  After <code>close</code>, no further operations can be
+performed on this connection or any cursor it created, and any in-progress
+transaction is implicitly rolled back.</p>
 </aside></script></section><section  data-markdown><script type="text/template">
 ### What do I do with a `Cursor`?
 
@@ -126,15 +128,18 @@ class Cursor:
     - *params* are variables for the query
     - Return value is unspecified
 
-<aside class="notes"><p>A <code>Cursor</code> manages the context of a single statement at a time.</p>
+<aside class="notes"><p>You use cursors to execute SQL statements and access their result sets.
+A <code>Cursor</code> manages the context of a single statement at a time.</p>
 <p>It&#39;s possible to have multiple cursors associated with a single connection.  In
 that case they are not isolated from one another; changes made using one cursor
 must be immediately visible to queries made using another cursor on the same
 connection.</p>
 <p>The <code>execute</code> method requests the database to run an arbitrary SQL statement.
-The <code>params</code>, if any, are variables to be sent to the database alongside the
-statement.  Using parametrized statements generally improves performance, and
-helps to prevent SQL injection attacks.</p>
+The <code>sql</code> argument specifies the statement to run.  The optional <code>params</code>
+argument provides variables to be sent to the database alongside the statement.
+This allows reusing the same statement to find or update different rows, in
+a way that performs better than string formatting and helps to prevent SQL
+injection attacks.</p>
 </aside></script></section><section  data-markdown><script type="text/template">
 ### How do I use parameters?
 
@@ -187,7 +192,7 @@ sets are exposed via three <code>fetch</code> methods.</p>
 <p><code>fetchone</code> returns the next row of the current result set as a Sequence, like
 a tuple or list, containing one element per returned column.</p>
 <p><code>fetchall</code> returns all remaining rows in the current result set as a Sequence
-of Sequences (like a list of tuples).  If no rows remain, an empty list is
+of Sequences (like a list of tuples).  If no rows remain, an empty Sequence is
 returned.</p>
 <p><code>fetchmany</code> behaves exactly like <code>fetchall</code> except that it will stop after
 fetching a user-specified number of rows, leaving any more sitting in the
@@ -211,9 +216,8 @@ class Cursor:
     - 2 mandatory items: name, type code
     - 5 optional items: display size, internal size, precision, scale, nullable
 
-<aside class="notes"><p>A <code>Cursor</code> has a <code>description</code> property that describing the current result set.
-It is a sequence where the Nth element in the sequence describes the Nth
-column in the result set.  Each of those elements is itself a sequence of
+<aside class="notes"><p><code>description</code> is a sequence where the Nth element in the sequence describes the
+Nth column in the result set.  Each of those elements is itself a sequence of
 7 items, with the first being its name and the second being a type code for it.
 I&#39;m not going to say much about the type code because the PEP goes into a lot
 of detail on it; suffice it to say that the module must provide global
@@ -497,8 +501,8 @@ a <code>DatabaseError</code> for any error reported to us by a cdb2api call.</p>
 <p><code>DataError</code> is raised if you try to write a value to a column that doesn&#39;t
 conform to its schema.</p>
 <p><code>OperationalError</code> is raised for things like broken network connections.</p>
-<p><code>IntegrityError</code> is raised if the given SQL transaction would violate table
-constraints.</p>
+<p><code>IntegrityError</code> is raised if the given SQL transaction would violate
+referential integrity.</p>
 <p><code>ProgrammingError</code> is raised for invalid SQL syntax.</p>
 <p>And in all of these cases, the cdb2api return code is sufficiently precise to
 allow us to easily determine which of these categories each error fell into,
@@ -575,12 +579,11 @@ int cdb2_clearbindings(cdb2_hndl_tp *hndl);
 * Parameters persist until cleared
 
 <aside class="notes"><p>Parameters are registered with the handle in advance by calls to
-<code>cdb2_bind_param</code>, which takes a name (like the name used in the <code>paramstyle</code>
-formats that take a Mapping), a type code, and a pointer to an object of that
-type along with its size (for variable-length things like strings and blobs).
-Any parameters that you&#39;ve bound with calls to <code>cdb2_bind_param</code> will be sent
-along with all future queries until you explicitly remove them with a call to
-<code>cdb2_clearbindings</code>.</p>
+<code>cdb2_bind_param</code>, which takes a name, a type code, and a pointer to an object
+of that type along with its size (for variable-length things like strings and
+blobs).  Any parameters that you&#39;ve bound with calls to <code>cdb2_bind_param</code> will
+be sent along with all future queries until you explicitly remove them with
+a call to <code>cdb2_clearbindings</code>.</p>
 </aside></script></section><section  data-markdown><script type="text/template">
 ### DB-API parameter support
 
@@ -598,7 +601,7 @@ update table set age=? where pet='?'
 ```
 ```sql
 -- format
-update table set age=%s where pet='%s'
+update table set age=%s where pet='%%s'
 ```
 ```sql
 -- numeric
@@ -623,7 +626,7 @@ update table set age=? where pet='?'
 ```
 ```sql
 -- format: explicitly discouraged
-update table set age=%s where pet='%s'
+update table set age=%s where pet='%%s'
 ```
 ```sql
 -- numeric
@@ -650,7 +653,7 @@ update table set age=? where pet='?'
 ```
 ```sql
 -- format: explicitly discouraged
-update table set age=%s where pet='%s'
+update table set age=%s where pet='%%s'
 ```
 ```sql
 -- numeric: requires a SQL parser
